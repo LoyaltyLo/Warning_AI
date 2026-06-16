@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Model files (large binaries — use Git LFS or separate storage)
+*.pth
+*.pkl
+
+# Training data
+mixed_tensors_train/
+
+# Logs
+logs/
+*.log
+
+# Evaluation results (generated)
+evaluation_results_*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Paper figures
+paper_figures/
+
+# Analysis archive
+analysis_archive/
