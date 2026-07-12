@@ -137,8 +137,8 @@ def _compute_adaptive_thresholds(smoothed_probs, calibration_windows=30, calib_d
     DEFAULT_P3 = 0.35
     DEFAULT_P3_TREND = 0.04
     DEFAULT_EXIT = 0.35
-    DEFAULT_P1_SUSTAIN = 4    # 6→4, 更快触发提前预警
-    DEFAULT_P3_SUSTAIN = 2    # 3→2, 趋势路径更灵敏
+    DEFAULT_P1_SUSTAIN = 4
+    DEFAULT_P3_SUSTAIN = 2
 
     if calib_data is None:
         calib_data = smoothed_probs[:calibration_windows]
@@ -206,9 +206,9 @@ def _compute_rolling_thresholds(smoothed_probs, calibration_windows=30, recalibr
 
 
 def _adaptive_alert(smoothed_probs, trend_signal=None,
-                    p1_enter=0.50, p2_enter=0.80, p3_enter=0.35,
+                    p1_enter=0.50, p2_enter=0.80, p3_enter=0.30,
                     p3_trend=0.05, exit_thresh=0.30,
-                    p1_sustain=4, p3_sustain=3,
+                    p1_sustain=3, p3_sustain=2,
                     pip_values=None):
     """
     🎯 自适应多路径报警系统 v3.3 — 个体化阈值 + 置信度加权冷却期
@@ -533,9 +533,89 @@ def extract_features(rr_window, aux_notes=None):
     denom = max(lower_std, upper_std)
     bimodality_ratio = min(lower_std, upper_std) / denom if denom > 1e-6 else 1.0
 
+    # P1: 多尺度样本熵 (7 scales, vectorized) + Recurrence Plot (6 features, vectorized)
+    mse_vals = [0.0] * 7
+    rp_det, rp_lam, rp_entr, rp_rr, rp_tt, rp_maxline = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    if len(rr_data_clean) >= 100:
+        # --- 多尺度样本熵 (scales 2,3,5,7,10,15,20, vectorized) ---
+        scales = [2, 3, 5, 7, 10, 15, 20]
+        for si, scale in enumerate(scales):
+            try:
+                n_c = len(rr_data_clean) // scale
+                if n_c >= 30:
+                    coarse = np.array([np.mean(rr_data_clean[i*scale:(i+1)*scale]) for i in range(n_c)])
+                    sd = np.std(coarse)
+                    if sd > 1e-8:
+                        r = 0.2 * sd; m = 2; N = n_c - m
+                        if N > 1:
+                            emb = np.lib.stride_tricks.sliding_window_view(coarse, m)
+                            from scipy.spatial.distance import cdist
+                            dists = cdist(emb, emb, metric='chebyshev')
+                            cnt = int(np.sum(np.triu(dists < r, k=1)))
+                            den = max(1, N * (N - 1) // 2)
+                            mse_vals[si] = np.clip(-np.log(max(1, cnt) / den), 0, 10)
+            except Exception:
+                pass
+        # --- Recurrence Plot (embedded phase space, vectorized) ---
+        try:
+            rr_z = (rr_data_clean - np.mean(rr_data_clean)) / (np.std(rr_data_clean) + 1e-8)
+            n_pts = len(rr_z) - 1
+            if n_pts > 20:
+                phase = np.column_stack([rr_z[:n_pts], rr_z[1:n_pts+1]])
+                th = 0.3 * np.std(rr_z)
+                max_diag = 40
+                diag_lens, vert_lens = [], []
+                n_recur = 0
+                for k in range(1, max_diag + 1):
+                    dists_k = np.sqrt((phase[:n_pts-k, 0] - phase[k:n_pts, 0])**2 +
+                                     (phase[:n_pts-k, 1] - phase[k:n_pts, 1])**2)
+                    is_rp = dists_k < th
+                    n_recur += int(np.sum(is_rp))
+                    changes = np.diff(np.concatenate([[0], is_rp.astype(np.int8), [0]]))
+                    starts = np.where(changes == 1)[0]
+                    ends = np.where(changes == -1)[0]
+                    for s, e in zip(starts, ends):
+                        if e - s >= 2:
+                            diag_lens.append(int(e - s))
+                n_recur *= 2
+                total = n_pts * max_diag * 2
+                if n_recur > 0:
+                    rp_rr = n_recur / total
+                    if diag_lens:
+                        rp_det = sum(diag_lens) / n_recur
+                        rp_maxline = max(diag_lens)
+                        rp_tt = np.mean(diag_lens)
+                        cnts = np.bincount([d for d in diag_lens if d >= 2])
+                        if len(cnts) > 0 and cnts.sum() > 0:
+                            p = cnts / cnts.sum()
+                            rp_entr = -sum(pp * np.log(max(pp, 1e-10)) for pp in p if pp > 0)
+                for j in range(n_pts):
+                    i_start = max(0, j - max_diag)
+                    i_end = min(n_pts, j + max_diag)
+                    if i_end <= i_start:
+                        continue
+                    dists_v = np.sqrt((phase[i_start:i_end, 0] - phase[j, 0])**2 +
+                                     (phase[i_start:i_end, 1] - phase[j, 1])**2)
+                    is_rp_v = dists_v < th
+                    changes = np.diff(np.concatenate([[0], is_rp_v.astype(np.int8), [0]]))
+                    starts = np.where(changes == 1)[0]
+                    ends = np.where(changes == -1)[0]
+                    for s, e in zip(starts, ends):
+                        if e - s >= 2:
+                            vert_lens.append(int(e - s))
+                if n_recur > 0 and vert_lens:
+                    rp_lam = sum(vert_lens) / n_recur
+        except Exception:
+            pass
+
     return [cv_suppressed, mad, rmssd_suppressed, pnn50_suppressed,
             samp_en, dfa_alpha1, pip, sd1, poincare_ratio, lf_hf_ratio,
-            sd2_normalized, pip_raw, dfa_raw, bigeminy_corr, bimodality_ratio]
+            sd2_normalized,
+            mse_vals[0], mse_vals[1], mse_vals[2], mse_vals[3],
+            mse_vals[4], mse_vals[5], mse_vals[6],
+            rp_det, rp_lam, rp_entr, rp_rr, rp_tt, rp_maxline,
+            pip_raw, dfa_raw, bigeminy_corr, bimodality_ratio]
 
 
 def get_ground_truth_episodes(aux_notes):
@@ -634,8 +714,8 @@ def evaluate_single_patient(args):
 
     total_duration_mins = cum_time_mins[-1]
 
-    device = torch.device("cpu")
-    model = AFibAttentionSeq2Seq(input_dim=16, hidden_dim=128).to(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AFibAttentionSeq2Seq(input_dim=29, hidden_dim=128).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
@@ -649,7 +729,7 @@ def evaluate_single_patient(args):
     all_raw_seqs = []
     pip_values = []  # 追踪每窗口原始pip值用于P0异位搏动压制
     current_beat = history_beats
-    last_valid_features = [0.0] * 15  # 15 HRV features
+    last_valid_features = [0.0] * 28  # 28 features (see extract_features return)
 
     # Load waveform for ECG strip visualization only (native rate, no resampling)
     eval_signals = None
@@ -692,9 +772,9 @@ def evaluate_single_patient(args):
 
     # 🌟 使用全局绝对标尺 (RobustScaler) 归一化
     X_raw_array = np.array(all_raw_seqs)
-    X_flat = X_raw_array.reshape(-1, 16)
+    X_flat = X_raw_array.reshape(-1, 29)
     X_norm_flat = scaler.transform(X_flat)
-    X_norm_array = X_norm_flat.reshape(-1, TIME_STEPS, 16)
+    X_norm_array = X_norm_flat.reshape(-1, TIME_STEPS, 29)
 
     X_tensor = torch.tensor(X_norm_array, dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -968,7 +1048,7 @@ def evaluate_single_patient(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=32, help='Use model_s<seed>.pth and scaler_s<seed>.pkl')
+    parser.add_argument('--seed', type=int, default=128, help='Use model_s<seed>.pth and scaler_s<seed>.pkl')
     args = parser.parse_args()
 
     setup_logging(log_file="logs/evaluate.log")
@@ -996,9 +1076,9 @@ if __name__ == "__main__":
         args_list = [(rec, model_path, scaler_path, plot_out_dir) for rec in records]
 
         results = []
-        with mp.Pool(2) as pool:  # reduced workers to avoid memory exhaustion
-            for res in tqdm(pool.imap_unordered(evaluate_single_patient, args_list), total=len(args_list)):
-                results.append(res)
+        # Single-process (mp.Pool breaks CUDA on Windows spawn)
+        for res in tqdm(map(evaluate_single_patient, args_list), total=len(args_list)):
+            results.append(res)
 
         # 数据聚合与高阶统计 v3
         total_hours = 0

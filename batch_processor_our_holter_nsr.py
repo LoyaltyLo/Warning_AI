@@ -234,9 +234,89 @@ def extract_features(rr_window, aux_notes=None):
     denom = max(lower_std, upper_std)
     bimodality_ratio = min(lower_std, upper_std) / denom if denom > 1e-6 else 1.0
 
+    # P1: 多尺度样本熵 (7 scales, vectorized) + Recurrence Plot (6 features, vectorized)
+    mse_vals = [0.0] * 7
+    rp_det, rp_lam, rp_entr, rp_rr, rp_tt, rp_maxline = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    if len(rr_data_clean) >= 100:
+        # --- 多尺度样本熵 (scales 2,3,5,7,10,15,20, vectorized) ---
+        scales = [2, 3, 5, 7, 10, 15, 20]
+        for si, scale in enumerate(scales):
+            try:
+                n_c = len(rr_data_clean) // scale
+                if n_c >= 30:
+                    coarse = np.array([np.mean(rr_data_clean[i*scale:(i+1)*scale]) for i in range(n_c)])
+                    sd = np.std(coarse)
+                    if sd > 1e-8:
+                        r = 0.2 * sd; m = 2; N = n_c - m
+                        if N > 1:
+                            emb = np.lib.stride_tricks.sliding_window_view(coarse, m)
+                            from scipy.spatial.distance import cdist
+                            dists = cdist(emb, emb, metric='chebyshev')
+                            cnt = int(np.sum(np.triu(dists < r, k=1)))
+                            den = max(1, N * (N - 1) // 2)
+                            mse_vals[si] = np.clip(-np.log(max(1, cnt) / den), 0, 10)
+            except Exception:
+                pass
+        # --- Recurrence Plot (embedded phase space, vectorized) ---
+        try:
+            rr_z = (rr_data_clean - np.mean(rr_data_clean)) / (np.std(rr_data_clean) + 1e-8)
+            n_pts = len(rr_z) - 1
+            if n_pts > 20:
+                phase = np.column_stack([rr_z[:n_pts], rr_z[1:n_pts+1]])
+                th = 0.3 * np.std(rr_z)
+                max_diag = 40
+                diag_lens, vert_lens = [], []
+                n_recur = 0
+                for k in range(1, max_diag + 1):
+                    dists_k = np.sqrt((phase[:n_pts-k, 0] - phase[k:n_pts, 0])**2 +
+                                     (phase[:n_pts-k, 1] - phase[k:n_pts, 1])**2)
+                    is_rp = dists_k < th
+                    n_recur += int(np.sum(is_rp))
+                    changes = np.diff(np.concatenate([[0], is_rp.astype(np.int8), [0]]))
+                    starts = np.where(changes == 1)[0]
+                    ends = np.where(changes == -1)[0]
+                    for s, e in zip(starts, ends):
+                        if e - s >= 2:
+                            diag_lens.append(int(e - s))
+                n_recur *= 2
+                total = n_pts * max_diag * 2
+                if n_recur > 0:
+                    rp_rr = n_recur / total
+                    if diag_lens:
+                        rp_det = sum(diag_lens) / n_recur
+                        rp_maxline = max(diag_lens)
+                        rp_tt = np.mean(diag_lens)
+                        cnts = np.bincount([d for d in diag_lens if d >= 2])
+                        if len(cnts) > 0 and cnts.sum() > 0:
+                            p = cnts / cnts.sum()
+                            rp_entr = -sum(pp * np.log(max(pp, 1e-10)) for pp in p if pp > 0)
+                for j in range(n_pts):
+                    i_start = max(0, j - max_diag)
+                    i_end = min(n_pts, j + max_diag)
+                    if i_end <= i_start:
+                        continue
+                    dists_v = np.sqrt((phase[i_start:i_end, 0] - phase[j, 0])**2 +
+                                     (phase[i_start:i_end, 1] - phase[j, 1])**2)
+                    is_rp_v = dists_v < th
+                    changes = np.diff(np.concatenate([[0], is_rp_v.astype(np.int8), [0]]))
+                    starts = np.where(changes == 1)[0]
+                    ends = np.where(changes == -1)[0]
+                    for s, e in zip(starts, ends):
+                        if e - s >= 2:
+                            vert_lens.append(int(e - s))
+                if n_recur > 0 and vert_lens:
+                    rp_lam = sum(vert_lens) / n_recur
+        except Exception:
+            pass
+
     return [cv_suppressed, mad, rmssd_suppressed, pnn50_suppressed,
             samp_en, dfa_alpha1, pip, sd1, poincare_ratio, lf_hf_ratio,
-            sd2_normalized, pip_raw, dfa_raw, bigeminy_corr, bimodality_ratio]
+            sd2_normalized,
+            mse_vals[0], mse_vals[1], mse_vals[2], mse_vals[3],
+            mse_vals[4], mse_vals[5], mse_vals[6],
+            rp_det, rp_lam, rp_entr, rp_rr, rp_tt, rp_maxline,
+            pip_raw, dfa_raw, bigeminy_corr, bimodality_ratio]
 
 
 # ═══════════════════════════════════════════════════════

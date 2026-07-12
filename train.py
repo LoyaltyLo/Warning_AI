@@ -140,34 +140,43 @@ def get_dataloaders_with_scaler(tensor_dir="./mixed_tensors_train", batch_size=1
 # ==========================================
 class AFibAttentionSeq2Seq(nn.Module):
     """
-    增强版房颤注意力序列模型 v2.0：
-    - 双层 LSTM + 残差连接
-    - 因果注意力机制
+    增强版房颤预警模型 v3.0：
+    - 双层 LSTM (双向第二层) + 残差连接 — 捕获前驱期双向上下文
+    - 多头注意力机制 — 不同时间尺度的前驱模式
     - 梯度流友好的融合层
     """
-    def __init__(self, input_dim=11, hidden_dim=64):
+    def __init__(self, input_dim=11, hidden_dim=64, num_heads=2):
         super(AFibAttentionSeq2Seq, self).__init__()
         self.hidden_dim = hidden_dim
 
-        # 输入投影层（将11维映射到hidden_dim，方便残差连接）
+        # 输入投影层
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
-        # 双层LSTM
+        # 第一层LSTM (单向, 提取基础时序特征)
         self.lstm1 = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
-        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
         self.layer_norm1 = nn.LayerNorm(hidden_dim)
-        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+
+        # 第二层BiLSTM (双向, 捕获前后上下文 — 关键改进)
+        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim, batch_first=True,
+                             bidirectional=True)
+        self.layer_norm2 = nn.LayerNorm(hidden_dim * 2)  # 双向输出2倍维度
+
         self.dropout = nn.Dropout(0.4)
 
-        # 因果注意力
-        self.attention_fc = nn.Linear(hidden_dim, 1)
+        # 多头注意力 (不同时间尺度)
+        self.num_heads = num_heads
+        self.attn_dim = hidden_dim * 2  # BiLSTM输出维度
+        self.head_dim = self.attn_dim // num_heads
+        self.attention_fc = nn.Linear(self.attn_dim, num_heads)
 
         # 融合层：LSTM输出 + 注意力上下文
-        self.fusion_fc = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fusion_fc = nn.Linear(self.attn_dim * 2, hidden_dim)
         self.output_layer = nn.Linear(hidden_dim, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+
         # 输入投影
         proj = torch.relu(self.input_proj(x))
 
@@ -175,27 +184,34 @@ class AFibAttentionSeq2Seq(nn.Module):
         lstm1_out, _ = self.lstm1(proj)
         lstm1_out = self.layer_norm1(lstm1_out)
         lstm1_out = self.dropout(lstm1_out)
-        lstm1_out = lstm1_out + proj  # 残差连接
+        lstm1_out = lstm1_out + proj
 
-        # LSTM Layer 2 + 残差
-        lstm2_out, _ = self.lstm2(lstm1_out)
+        # BiLSTM Layer 2 + 残差
+        lstm2_out, _ = self.lstm2(lstm1_out)  # (B, seq, 2*hidden_dim)
         lstm2_out = self.layer_norm2(lstm2_out)
         lstm2_out = self.dropout(lstm2_out)
-        lstm2_out = lstm2_out + lstm1_out  # 残差连接
+        # 残差对齐: lstm1_out (hidden_dim) → 复制到 2*hidden_dim
+        lstm1_padded = torch.cat([lstm1_out, lstm1_out], dim=-1)
+        lstm2_out = lstm2_out + lstm1_padded
 
-        # 因果注意力
-        seq_len = lstm2_out.size(1)
-        attn_scores = self.attention_fc(lstm2_out).transpose(1, 2)
-        scores_expanded = attn_scores.expand(-1, seq_len, -1)
-        mask = torch.tril(torch.ones(seq_len, seq_len)).to(x.device)
-        scores_masked = scores_expanded.masked_fill(mask.unsqueeze(0) == 0, float('-inf'))
-        attn_weights = F.softmax(scores_masked, dim=2)
-        context = torch.bmm(attn_weights, lstm2_out)
+        # 多头注意力: 每头独立计算, 平均后融合
+        attn_scores = self.attention_fc(lstm2_out)  # (B, seq, num_heads)
+        attn_scores = attn_scores.transpose(1, 2)     # (B, num_heads, seq)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        context_avg = 0
+        for h in range(self.num_heads):
+            w = attn_weights[:, h:h+1, :]  # (B, 1, seq)
+            ctx = torch.bmm(w, lstm2_out)   # (B, 1, attn_dim)
+            context_avg = context_avg + ctx
+        context_avg = context_avg / self.num_heads
+        context = context_avg.expand(-1, seq_len, -1)  # (B, seq, attn_dim)
 
         # 融合 + 输出
-        fused_state = torch.relu(self.fusion_fc(torch.cat([lstm2_out, context], dim=-1)))
+        fused_state = torch.relu(self.fusion_fc(
+            torch.cat([lstm2_out, context], dim=-1)))
         probs = self.sigmoid(self.output_layer(fused_state)).squeeze(-1)
-        return probs, attn_weights[:, -1, :]
+        return probs, attn_weights.mean(dim=1)
 
 
 # ==========================================
@@ -260,7 +276,7 @@ def train_model(seed=42):
 
     train_loader, val_loader = get_dataloaders_with_scaler(seed=seed)
 
-    model = AFibAttentionSeq2Seq(input_dim=16, hidden_dim=128).to(device)
+    model = AFibAttentionSeq2Seq(input_dim=29, hidden_dim=128).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"模型参数量: {total_params:,}")
 
@@ -343,7 +359,7 @@ def train_model(seed=42):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=32)
+    parser.add_argument('--seed', type=int, default=128)
     args = parser.parse_args()
     setup_logging(log_file=f"logs/train_s{args.seed}.log")
     train_model(seed=args.seed)
