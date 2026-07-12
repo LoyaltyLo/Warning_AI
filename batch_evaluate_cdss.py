@@ -740,21 +740,27 @@ def evaluate_single_patient(args):
     except Exception:
         pass
 
+    # Feature cache: pre-compute once per window position (95% overlap = huge waste otherwise)
+    feature_cache = {}
+
+    def _get_features(beat_pos):
+        key = beat_pos // STEP_BEATS  # nearest step-aligned cache key
+        if key not in feature_cache:
+            w_end = beat_pos
+            w_start = max(0, w_end - WINDOW_BEATS)
+            if w_end - w_start >= 50:
+                feat = extract_features(rr_intervals[w_start:w_end], aux_notes_dense[w_start:w_end])
+                feature_cache[key] = feat if feat is not None else last_valid_features
+            else:
+                feature_cache[key] = last_valid_features
+        return feature_cache[key]
+
     while current_beat < len(rr_intervals):
         sequence_features = []
         for i in range(TIME_STEPS):
             w_end = current_beat - (TIME_STEPS - 1 - i) * WINDOW_BEATS
-            w_start = w_end - WINDOW_BEATS
-            rr_window = rr_intervals[w_start:w_end]
-            notes_window = aux_notes_dense[w_start:w_end]
-            feats_hrv = extract_features(rr_window, notes_window)
-
-            if feats_hrv is not None:
-                feats = feats_hrv  # 15D HRV features
-                sequence_features.append(feats)
-                last_valid_features = feats
-            else:
-                sequence_features.append(last_valid_features)
+            feats = _get_features(w_end)
+            sequence_features.append(feats)
 
         final_seq_feats = []
         for j in range(len(sequence_features)):
@@ -1028,9 +1034,18 @@ def evaluate_single_patient(args):
         if prob_vals:
             metrics['alarm_confidences'].append(float(np.mean(prob_vals)))
 
+    # --- 确定首次TP时间点（首次命中后不再计FP，节律已被破坏）---
+    first_tp_time = None
+    if matched_alarm_indices:
+        first_matched_idx = min(matched_alarm_indices)
+        first_tp_time = ai_alarms[first_matched_idx]['start']
+
     # --- 误报统计 ---
     for idx, alarm in enumerate(ai_alarms):
         if idx in matched_alarm_indices:
+            continue
+        # 首次TP之后的告警：节律已被房颤破坏，不计为FP
+        if first_tp_time is not None and alarm['start'] >= first_tp_time:
             continue
         is_false_alarm = True
         for gt in merged_gt:
